@@ -231,14 +231,12 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
             requires_grad=False,
         )
         layer.register_parameter("w13_qzeros", w13_qzeros)
-        w13_qweight = (
-            torch.nn.Parameter(
-                _unpack_weight_from_int32(
-                    weight=layer.w13_qweight.data,
-                    pack_factor=self.pack_factor,
-                ),
-                requires_grad=False,
+        w13_qweight = torch.nn.Parameter(
+            _unpack_weight_from_int32(
+                weight=layer.w13_qweight.data,
+                pack_factor=self.pack_factor,
             ),
+            requires_grad=False,
         )
         layer.register_parameter("w13_qweight", w13_qweight)
 

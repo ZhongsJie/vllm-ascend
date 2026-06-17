@@ -21,10 +21,13 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.quantization.awq_config import AWQConfig
-from vllm_ascend.quantization.methods.w4a16_awq import (AscendW4A16AWQFusedMoEMethod,
-                                                         AscendW4A16AWQLinearMethod,
-                                                         _unpack_qzero_from_int32,
-                                                         _unpack_weight_from_int32)
+from vllm_ascend.quantization.methods.w4a16_awq import (
+    REVERSE_AWQ_PACK_ORDER,
+    AscendW4A16AWQFusedMoEMethod,
+    AscendW4A16AWQLinearMethod,
+    _unpack_qzero_from_int32,
+    _unpack_weight_from_int32,
+)
 
 
 class TestAWQConfig(TestBase):
@@ -96,16 +99,13 @@ class TestAscendW4A16AWQLinearMethod(TestBase):
         # Original vLLM AWQ format weights
         num_groups = hidden_size // group_size
         layer.qweight = torch.nn.Parameter(
-            torch.randint(0, 100, (hidden_size, out_features // pack_factor), dtype=torch.int32),
-            requires_grad=False
+            torch.randint(0, 100, (hidden_size, out_features // pack_factor), dtype=torch.int32), requires_grad=False
         )
         layer.qzeros = torch.nn.Parameter(
-            torch.randint(0, 100, (num_groups, out_features // pack_factor), dtype=torch.int32),
-            requires_grad=False
+            torch.randint(0, 100, (num_groups, out_features // pack_factor), dtype=torch.int32), requires_grad=False
         )
         layer.scales = torch.nn.Parameter(
-            torch.ones((num_groups, out_features), dtype=torch.bfloat16),
-            requires_grad=False
+            torch.ones((num_groups, out_features), dtype=torch.bfloat16), requires_grad=False
         )
 
         # Process weights
@@ -192,6 +192,11 @@ class TestAscendW4A16AWQFusedMoEMethod(TestBase):
 
     def setUp(self):
         super().setUp()
+        self.ascend_config_patcher = patch("vllm_ascend.quantization.methods.w4a16_awq.get_ascend_config")
+        mock_get_ascend_config = self.ascend_config_patcher.start()
+        mock_get_ascend_config.return_value.eplb_config.dynamic_eplb = False
+        self.addCleanup(self.ascend_config_patcher.stop)
+
         self.quant_config = AWQConfig(
             weight_bits=4,
             group_size=128,
@@ -238,9 +243,67 @@ class TestAscendW4A16AWQFusedMoEMethod(TestBase):
         self.assertEqual(result["w13_qzeros"].dtype, torch.int32)
         self.assertEqual(result["w2_qzeros"].dtype, torch.int32)
 
+    def test_process_weights_after_loading_registers_moe_parameters(self):
+        """Test MoE AWQ post-processing registers Parameters, not tuples."""
+        num_experts = 2
+        intermediate = 256
+        hidden = 128
+        pack_factor = self.quant_method.pack_factor
+        group_size = self.quant_method.group_size
+
+        layer = torch.nn.Module()
+        layer.w13_qweight = torch.nn.Parameter(
+            torch.randint(0, 100, (num_experts, hidden, 2 * intermediate // pack_factor), dtype=torch.int32),
+            requires_grad=False,
+        )
+        layer.w2_qweight = torch.nn.Parameter(
+            torch.randint(0, 100, (num_experts, intermediate, hidden // pack_factor), dtype=torch.int32),
+            requires_grad=False,
+        )
+        layer.w13_qzeros = torch.nn.Parameter(
+            torch.randint(
+                0, 100, (num_experts, hidden // group_size, 2 * intermediate // pack_factor), dtype=torch.int32
+            ),
+            requires_grad=False,
+        )
+        layer.w2_qzeros = torch.nn.Parameter(
+            torch.randint(
+                0,
+                100,
+                (num_experts, intermediate // group_size, hidden // pack_factor),
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.w13_scales = torch.nn.Parameter(
+            torch.ones((num_experts, hidden // group_size, 2 * intermediate), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.w2_scales = torch.nn.Parameter(
+            torch.ones((num_experts, intermediate // group_size, hidden), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        self.assertIsInstance(layer.w13_qweight, torch.nn.Parameter)
+        self.assertIsInstance(layer.w2_qweight, torch.nn.Parameter)
+        self.assertEqual(layer.w13_qweight.shape, (num_experts, hidden, 2 * intermediate // pack_factor))
+        self.assertEqual(layer.w2_qweight.shape, (num_experts, intermediate, hidden // pack_factor))
+        self.assertEqual(layer.w13_qzeros.shape, (num_experts, hidden // group_size, 2 * intermediate))
+        self.assertEqual(layer.w2_qzeros.shape, (num_experts, intermediate // group_size, hidden))
+        self.assertFalse(layer.w13_qweight.requires_grad)
+        self.assertFalse(layer.w2_qweight.requires_grad)
+
 
 class TestUnpackQzeroFromInt32(TestBase):
     """Test unpack_qzero_from_int32 function for AWQ zero-points."""
+
+    def _pack_awq_zero_points(self, values: list[int]) -> torch.Tensor:
+        packed = 0
+        for index, value in enumerate(values):
+            packed |= value << (REVERSE_AWQ_PACK_ORDER[index] * 4)
+        return torch.tensor([[packed]], dtype=torch.int32)
 
     def test_unpack_qzero_from_int32_linear_layer(self):
         """Test unpacking zero-points for linear layer."""
@@ -274,10 +337,20 @@ class TestUnpackQzeroFromInt32(TestBase):
         result = _unpack_qzero_from_int32(weight, param_dtype, pack_factor=8, is_moe_layer=False)
 
         # Each int32 element unpacks to 8 nibbles; element k's lowest nibble lands at index k*8.
-        self.assertEqual(result[0, 0].item(), 8)    # element 0: 0 -> -(0-8) = 8
-        self.assertEqual(result[0, 8].item(), 7)    # element 1: 1 -> -(1-8) = 7
-        self.assertEqual(result[0, 24].item(), 0)   # element 3: 8 -> -(8-8) = 0 (zero point)
+        self.assertEqual(result[0, 0].item(), 8)  # element 0: 0 -> -(0-8) = 8
+        self.assertEqual(result[0, 8].item(), 7)  # element 1: 1 -> -(1-8) = 7
+        self.assertEqual(result[0, 24].item(), 0)  # element 3: 8 -> -(8-8) = 0 (zero point)
         self.assertEqual(result[0, 48].item(), -7)  # element 6: 15 -> -(15-8) = -7
+
+    def test_unpack_qzero_matches_npu_antiquant_offset_semantics(self):
+        """Test AutoAWQ zero points are converted to NPU antiquant offsets."""
+        awq_zero_points = [0, 1, 7, 8, 9, 10, 15, 3]
+        weight = self._pack_awq_zero_points(awq_zero_points)
+
+        result = _unpack_qzero_from_int32(weight, torch.float16, pack_factor=8, is_moe_layer=False)
+
+        expected_offsets = torch.tensor([[8, 7, 1, 0, -1, -2, -7, 5]], dtype=torch.float16)
+        torch.testing.assert_close(result, expected_offsets)
 
 
 class TestUnpackWeightFromInt32(TestBase):
@@ -315,4 +388,5 @@ class TestUnpackWeightFromInt32(TestBase):
 
 if __name__ == "__main__":
     import unittest
+
     unittest.main()
